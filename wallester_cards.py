@@ -161,10 +161,10 @@ class WallesterClient:
 
 def build_client(args: argparse.Namespace) -> WallesterClient:
     load_env_file(Path(args.env_file))
-    token = args.token or os.getenv("WALLESTER_TOKEN")
+    token = args.token or os.getenv("TOKEN")
     if not token:
-        raise SystemExit("Укажите WALLESTER_TOKEN в .env/переменных окружения или передайте --token.")
-    base_url = args.base_url or os.getenv("WALLESTER_BASE_URL", DEFAULT_BASE_URL)
+        raise SystemExit("Set TOKEN in .env/environment or pass --token.")
+    base_url = args.base_url or os.getenv("BASE_URL", DEFAULT_BASE_URL)
     return WallesterClient(base_url=base_url, token=token, timeout=args.timeout)
 
 
@@ -266,7 +266,7 @@ def command_close(args: argparse.Namespace) -> None:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env-file", default=".env", help="Путь к dotenv-конфигу.")
     parser.add_argument("--base-url", help=f"Базовый URL API. По умолчанию: {DEFAULT_BASE_URL}")
-    parser.add_argument("--token", help="JWT-токен. Лучше хранить в WALLESTER_TOKEN внутри .env.")
+    parser.add_argument("--token", help="JWT token. Prefer TOKEN in .env.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout в секундах.")
 
 
@@ -307,27 +307,27 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--output", help="Записать JSON-ответ в файл.")
     get.set_defaults(func=command_get)
 
-    export = subparsers.add_parser("export", help="Найти/выгрузить карты.")
+    export = subparsers.add_parser("export", help="Найти/выгрузить карты")
     export.add_argument("--masked-card-number")
     export.add_argument("--reference-number")
     export.add_argument("--external-id")
     export.add_argument("--from-record", type=int, default=0)
     export.add_argument("--records-count", type=int, default=100)
     export.add_argument("--order-direction", choices=["asc", "desc", "ASC", "DESC"])
-    export.add_argument("--order-fields", action="append", help="Поле сортировки. Можно передавать несколько раз.")
+    export.add_argument("--order-fields", action="append", help="Поле сортировки. Можно передавать несколько раз")
     export.add_argument("--format", choices=["csv", "json"], default="csv")
-    export.add_argument("--fields", help="CSV-поля через запятую.")
-    export.add_argument("--full", action="store_true", help="Для JSON: вывести полный ответ с total_records_number.")
-    export.add_argument("--output", help="Записать выгрузку в файл.")
+    export.add_argument("--fields", help="CSV-поля через запятую")
+    export.add_argument("--full", action="store_true", help="Для JSON: вывести полный ответ с total_records_number")
+    export.add_argument("--output", help="Записать выгрузку в файл")
     export.set_defaults(func=command_export)
 
-    rename = subparsers.add_parser("rename", help="Переименовать карту.")
+    rename = subparsers.add_parser("rename", help="Переименовать карту")
     rename.add_argument("card_id")
     rename.add_argument("name")
-    rename.add_argument("--output", help="Записать JSON-ответ в файл.")
+    rename.add_argument("--output", help="Записать JSON-ответ в файл")
     rename.set_defaults(func=command_rename)
 
-    close = subparsers.add_parser("close", help="Закрыть карту.")
+    close = subparsers.add_parser("close", help="Закрыть карту")
     close.add_argument("card_id")
     close.add_argument("--reason", default="ClosedByClient", choices=[
         "ClosedByIssuer",
@@ -336,8 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
         "ClosedByCardholder",
         "ClosedByReplace",
     ])
-    close.add_argument("--yes", action="store_true", help="Подтвердить операцию, которая меняет состояние карты.")
-    close.add_argument("--output", help="Записать JSON-ответ в файл.")
+    close.add_argument("--yes", action="store_true", help="Подтвердить операцию, которая меняет состояние карты")
+    close.add_argument("--output", help="Записать JSON-ответ в файл")
     close.set_defaults(func=command_close)
 
     return parser
