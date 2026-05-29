@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import email.utils
+import hashlib
 import json
+import math
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +18,11 @@ from typing import Any
 
 
 DEFAULT_BASE_URL = "https://api-frontend.wallester.com"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
 DEFAULT_EXPORT_FIELDS = [
     "id",
     "name",
@@ -29,10 +39,284 @@ DEFAULT_EXPORT_FIELDS = [
     "external_id",
     "reference_number",
 ]
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 class WallesterError(RuntimeError):
     pass
+
+
+class JWTError(RuntimeError):
+    pass
+
+
+class DERReader:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+
+    def read_byte(self) -> int:
+        if self.pos >= len(self.data):
+            raise JWTError("Unexpected end of DER data.")
+        value = self.data[self.pos]
+        self.pos += 1
+        return value
+
+    def read_length(self) -> int:
+        first = self.read_byte()
+        if first < 0x80:
+            return first
+        size = first & 0x7F
+        if size == 0:
+            raise JWTError("Indefinite DER lengths are not supported.")
+        value = 0
+        for _ in range(size):
+            value = (value << 8) | self.read_byte()
+        return value
+
+    def read_tlv(self, expected_tag: int | None = None) -> bytes:
+        tag = self.read_byte()
+        if expected_tag is not None and tag != expected_tag:
+            raise JWTError(f"Unexpected DER tag 0x{tag:02x}; expected 0x{expected_tag:02x}.")
+        length = self.read_length()
+        end = self.pos + length
+        if end > len(self.data):
+            raise JWTError("DER length exceeds input size.")
+        value = self.data[self.pos:end]
+        self.pos = end
+        return value
+
+    def eof(self) -> bool:
+        return self.pos >= len(self.data)
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def read_pem_der(path: str) -> tuple[str, bytes]:
+    text = Path(path).read_text(encoding="utf-8").strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    header = next((line for line in lines if line.startswith("-----BEGIN ")), "")
+    footer = next((line for line in lines if line.startswith("-----END ")), "")
+    if not header or not footer:
+        raise JWTError(f"{path}: expected PEM private key.")
+    label = header.removeprefix("-----BEGIN ").removesuffix("-----")
+    if "ENCRYPTED" in label:
+        raise JWTError("Encrypted private keys are not supported. Use an unencrypted PEM private key.")
+    body = "".join(line for line in lines if not line.startswith("-----"))
+    return label, base64.b64decode(body)
+
+
+def parse_int(reader: DERReader) -> int:
+    value = reader.read_tlv(0x02)
+    return int.from_bytes(value, "big", signed=False)
+
+
+def parse_pkcs1_private_key(der: bytes) -> tuple[int, int, int]:
+    seq = DERReader(DERReader(der).read_tlv(0x30))
+    _version = parse_int(seq)
+    modulus = parse_int(seq)
+    public_exponent = parse_int(seq)
+    private_exponent = parse_int(seq)
+    return modulus, public_exponent, private_exponent
+
+
+def parse_pkcs8_private_key(der: bytes) -> tuple[int, int, int]:
+    seq = DERReader(DERReader(der).read_tlv(0x30))
+    _version = parse_int(seq)
+    _algorithm_identifier = seq.read_tlv(0x30)
+    private_key_octets = seq.read_tlv(0x04)
+    return parse_pkcs1_private_key(private_key_octets)
+
+
+def resolve_project_path(path: str) -> Path:
+    private_key_path = Path(path).expanduser()
+    if not private_key_path.is_absolute():
+        private_key_path = PROJECT_ROOT / private_key_path
+    return private_key_path
+
+
+def load_rsa_private_numbers(path: str) -> tuple[int, int, int]:
+    private_key_path = resolve_project_path(path)
+    label, der = read_pem_der(str(private_key_path))
+    if label == "RSA PRIVATE KEY":
+        return parse_pkcs1_private_key(der)
+    if label == "PRIVATE KEY":
+        return parse_pkcs8_private_key(der)
+    raise JWTError(f"Unsupported PEM key type: {label}")
+
+
+def rsa_sha256_sign(message: bytes, modulus: int, private_exponent: int) -> bytes:
+    digest = hashlib.sha256(message).digest()
+    digest_info_prefix = bytes.fromhex("3031300d060960864801650304020105000420")
+    digest_info = digest_info_prefix + digest
+    key_size = (modulus.bit_length() + 7) // 8
+    padding_size = key_size - len(digest_info) - 3
+    if padding_size < 8:
+        raise JWTError("RSA key is too small for RS256 signing.")
+    encoded = b"\x00\x01" + (b"\xff" * padding_size) + b"\x00" + digest_info
+    signature = pow(int.from_bytes(encoded, "big"), private_exponent, modulus)
+    return signature.to_bytes(key_size, "big")
+
+
+def der_len(length: int) -> bytes:
+    if length < 0x80:
+        return bytes([length])
+    raw = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def der_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + der_len(len(value)) + value
+
+
+def der_int(value: int) -> bytes:
+    raw = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return der_tlv(0x02, raw)
+
+
+def rsa_public_key_pem_base64(private_key_path: str) -> str:
+    modulus, public_exponent, _private_exponent = load_rsa_private_numbers(private_key_path)
+    rsa_public_key = der_tlv(0x30, der_int(modulus) + der_int(public_exponent))
+    algorithm = der_tlv(0x30, der_tlv(0x06, bytes.fromhex("2a864886f70d010101")) + der_tlv(0x05, b""))
+    subject_public_key_info = der_tlv(0x30, algorithm + der_tlv(0x03, b"\x00" + rsa_public_key))
+    body = base64.encodebytes(subject_public_key_info).decode("ascii").replace("\n", "")
+    lines = [body[index : index + 64] for index in range(0, len(body), 64)]
+    pem = "-----BEGIN PUBLIC KEY-----\n" + "\n".join(lines) + "\n-----END PUBLIC KEY-----\n"
+    return base64.b64encode(pem.encode("ascii")).decode("ascii")
+
+
+def mgf1(seed: bytes, length: int, hash_name: str) -> bytes:
+    output = b""
+    counter = 0
+    while len(output) < length:
+        output += hashlib.new(hash_name, seed + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return output[:length]
+
+
+def xor_bytes(left: bytes, right: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(left, right))
+
+
+def unpad_pkcs1_v15(encoded: bytes) -> bytes | None:
+    if not encoded.startswith(b"\x00\x02"):
+        return None
+    separator = encoded.find(b"\x00", 2)
+    if separator < 10:
+        return None
+    return encoded[separator + 1 :]
+
+
+def unpad_oaep(
+    encoded: bytes,
+    hash_name: str,
+    mgf_hash_name: str | None = None,
+    label: bytes = b"",
+) -> bytes | None:
+    mgf_hash_name = mgf_hash_name or hash_name
+    digest_size = hashlib.new(hash_name).digest_size
+    if len(encoded) < 2 * digest_size + 2 or encoded[0] != 0:
+        return None
+    masked_seed = encoded[1 : 1 + digest_size]
+    masked_db = encoded[1 + digest_size :]
+    seed = xor_bytes(masked_seed, mgf1(masked_db, digest_size, mgf_hash_name))
+    data_block = xor_bytes(masked_db, mgf1(seed, len(masked_db), mgf_hash_name))
+    label_hash = hashlib.new(hash_name, label).digest()
+    if data_block[:digest_size] != label_hash:
+        return None
+    index = digest_size
+    while index < len(data_block) and data_block[index] == 0:
+        index += 1
+    if index >= len(data_block) or data_block[index] != 1:
+        return None
+    return data_block[index + 1 :]
+
+
+def clean_encrypted_message(encrypted_value: str) -> tuple[str, bytes | None]:
+    labels = []
+    body_lines = []
+    for raw_line in str(encrypted_value).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("-----BEGIN ") and line.endswith(" MESSAGE-----"):
+            label = line.removeprefix("-----BEGIN ").removesuffix(" MESSAGE-----")
+            labels.append(label.encode("utf-8"))
+            continue
+        if line.startswith("-----END ") and line.endswith(" MESSAGE-----"):
+            continue
+        body_lines.append(line)
+    return "".join(body_lines), labels[0] if labels else None
+
+
+def rsa_decrypt_text(encrypted_value: str, private_key_path: str) -> str:
+    modulus, _public_exponent, private_exponent = load_rsa_private_numbers(private_key_path)
+    encrypted_compact, message_label = clean_encrypted_message(encrypted_value)
+    encrypted_compact += "=" * (-len(encrypted_compact) % 4)
+    cipher = base64.urlsafe_b64decode(encrypted_compact)
+    key_size = (modulus.bit_length() + 7) // 8
+    encoded = pow(int.from_bytes(cipher, "big"), private_exponent, modulus).to_bytes(key_size, "big")
+    oaep_variants = [
+        ("sha1", "sha1"),
+        ("sha224", "sha224"),
+        ("sha256", "sha256"),
+        ("sha384", "sha384"),
+        ("sha512", "sha512"),
+        ("sha256", "sha1"),
+        ("sha384", "sha1"),
+        ("sha512", "sha1"),
+    ]
+    labels = [b""]
+    if message_label:
+        labels.insert(0, message_label)
+    for unpadded in (
+        unpad_pkcs1_v15(encoded),
+        *(
+            unpad_oaep(encoded, hash_name, mgf_hash_name, label)
+            for label in labels
+            for hash_name, mgf_hash_name in oaep_variants
+        ),
+    ):
+        if unpadded is not None:
+            return unpadded.decode("utf-8")
+    raise JWTError("Unable to decrypt RSA value with supported paddings.")
+
+
+class WallesterJWTProvider:
+    def __init__(self, api_key: str, private_key_path: str, timestamp_offset: int = 0) -> None:
+        if not api_key:
+            raise JWTError("API_KEY is empty.")
+        if not private_key_path:
+            raise JWTError("PRIVATE_KEY_PATH is empty.")
+        self.api_key = api_key
+        self.timestamp_offset = timestamp_offset
+        self.modulus, _public_exponent, self.private_exponent = load_rsa_private_numbers(private_key_path)
+
+    def adjust_timestamp_offset(self, server_date: str | None = None) -> None:
+        if server_date:
+            try:
+                server_time = email.utils.parsedate_to_datetime(server_date).timestamp()
+            except (TypeError, ValueError):
+                server_time = None
+            if server_time is not None:
+                self.timestamp_offset = math.ceil(server_time - time.time())
+                return
+        self.timestamp_offset = 0
+
+    def token(self) -> str:
+        header = {"typ": "JWT", "alg": "RS256"}
+        payload = {"api_key": self.api_key, "ts": int(time.time()) + self.timestamp_offset}
+        signing_input = (
+            b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+            + "."
+            + b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        ).encode("ascii")
+        signature = rsa_sha256_sign(signing_input, self.modulus, self.private_exponent)
+        return signing_input.decode("ascii") + "." + b64url(signature)
 
 
 def load_env_file(path: Path) -> None:
@@ -81,14 +365,29 @@ def output_json(data: Any, output: str | None = None) -> None:
 
 
 class WallesterClient:
-    def __init__(self, base_url: str, token: str, timeout: int = 60) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str | None = None,
+        timeout: int = 60,
+        jwt_provider: WallesterJWTProvider | None = None,
+        user_agent: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.token = token
+        self.jwt_provider = jwt_provider
         self.headers = {
-            "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "User-Agent": user_agent or DEFAULT_USER_AGENT,
         }
+
+    def auth_headers(self) -> dict[str, str]:
+        token = self.jwt_provider.token() if self.jwt_provider else self.token
+        if not token:
+            raise WallesterError("JWT token is not configured.")
+        return {**self.headers, "Authorization": f"Bearer {token}"}
 
     def request(
         self,
@@ -107,19 +406,28 @@ class WallesterClient:
         if body is not None:
             data = json.dumps(body).encode("utf-8")
 
-        req = urllib.request.Request(url, data=data, method=method, headers=self.headers)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                payload = response.read()
-        except urllib.error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            raise WallesterError(f"{method} {path} failed: HTTP {exc.code}: {details}") from exc
-        except urllib.error.URLError as exc:
-            raise WallesterError(f"{method} {path} failed: {exc.reason}") from exc
+        payload = self._urlopen_json(method, path, url, data)
 
         if not payload:
             return None
         return json.loads(payload.decode("utf-8"))
+
+    def _urlopen_json(self, method: str, path: str, url: str, data: bytes | None) -> bytes:
+        for attempt in range(3):
+            req = urllib.request.Request(url, data=data, method=method, headers=self.auth_headers())
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 401 and "JWT token expired" in details and attempt < 2:
+                    if self.jwt_provider:
+                        self.jwt_provider.adjust_timestamp_offset(exc.headers.get("Date"))
+                    continue
+                raise WallesterError(f"{method} {path} failed: HTTP {exc.code}: {details}") from exc
+            except urllib.error.URLError as exc:
+                raise WallesterError(f"{method} {path} failed: {exc.reason}") from exc
+        return b""
 
     def create_card(self, payload: dict[str, Any], send_notification: bool | None = None) -> Any:
         return self.request(
@@ -134,6 +442,9 @@ class WallesterClient:
 
     def search_cards(self, query: dict[str, Any]) -> Any:
         return self.request("GET", "/v1/cards", query=query)
+
+    def search_accounts(self, query: dict[str, Any]) -> Any:
+        return self.request("GET", "/v1/accounts", query=query)
 
     def rename_card(self, card_id: str, name: str) -> Any:
         return self.request("PATCH", f"/v1/cards/{urllib.parse.quote(card_id)}/name", body={"name": name})
@@ -162,10 +473,25 @@ class WallesterClient:
 def build_client(args: argparse.Namespace) -> WallesterClient:
     load_env_file(Path(args.env_file))
     token = args.token or os.getenv("TOKEN")
+    api_key = os.getenv("API_KEY")
+    private_key_path = os.getenv("PRIVATE_KEY_PATH")
+    jwt_provider = None
     if not token:
-        raise SystemExit("Set TOKEN in .env/environment or pass --token.")
+        if not api_key or not private_key_path:
+            raise SystemExit("Set API_KEY and PRIVATE_KEY_PATH in .env, or pass --token.")
+        jwt_provider = WallesterJWTProvider(
+            api_key=api_key,
+            private_key_path=private_key_path,
+        )
     base_url = args.base_url or os.getenv("BASE_URL", DEFAULT_BASE_URL)
-    return WallesterClient(base_url=base_url, token=token, timeout=args.timeout)
+    user_agent = os.getenv("USER_AGENT", DEFAULT_USER_AGENT)
+    return WallesterClient(
+        base_url=base_url,
+        token=token,
+        timeout=args.timeout,
+        jwt_provider=jwt_provider,
+        user_agent=user_agent,
+    )
 
 
 def command_issue(args: argparse.Namespace) -> None:
@@ -266,7 +592,7 @@ def command_close(args: argparse.Namespace) -> None:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env-file", default=".env", help="Путь к dotenv-конфигу.")
     parser.add_argument("--base-url", help=f"Базовый URL API. По умолчанию: {DEFAULT_BASE_URL}")
-    parser.add_argument("--token", help="JWT token. Prefer TOKEN in .env.")
+    parser.add_argument("--token", help="Manual JWT token for temporary testing. Normal mode uses API_KEY and PRIVATE_KEY_PATH.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout в секундах.")
 
 

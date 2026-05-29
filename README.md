@@ -1,50 +1,43 @@
-# Автоматизация карт Wallester
+# Терминальный клиент Wallester
 
-Небольшой Python CLI-скрипт для базового жизненного цикла карт через Wallester Frontend API:
-
-- выпуск карты: `POST /v1/cards`
-- поиск и выгрузка карт: `GET /v1/cards`
-- получение данных по карте: `GET /v1/cards/{card_id}`
-- переименование карты: `PATCH /v1/cards/{card_id}/name`
-- закрытие карты: `PATCH /v1/cards/{card_id}/close`
+Инструмент предназначен для работы с картами Wallester через простое меню в терминале
 
 ## Настройка
 
-Скопируйте пример конфига и укажите JWT-токен:
+1. Скопируйте пример настроек:
 
 ```powershell
 Copy-Item .env.example .env
-notepad .env
 ```
 
-В `.env` должны быть значения:
+2. Откройте `.env` и заполните значения:
 
 ```env
-BASE_URL=https://api-frontend.wallester.com
-TOKEN=replace_with_jwt_token
+==== Можем оставить дефолтные значения ====
+BASE_URL=https://api-frontend.wallester.com  -  
+USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
+PRIVATE_KEY_PATH=wallester_private.pem
+CARD_DATA_PRIVATE_KEY_PATH=wallester_private.pem
+
+==== Необходимо вставить свои значения ====
+API_KEY=replace_with_api_key
 3DS_EMAIL=codes@example.com
 3DS_PASSWORD=Card3DS2026!
 ```
 
-Скрипт использует только стандартную библиотеку Python, зависимости устанавливать не нужно.
+Что означает:
 
-## Команды
+- `BASE_URL` — адрес API Wallester
+- `USER_AGENT` — заголовок клиента для запросов к API
+- `PRIVATE_KEY_PATH` — путь к PEM private key для генерации JWT. Нужен незашифрованный private key без пароля
+- `CARD_DATA_PRIVATE_KEY_PATH` — путь к PEM private key для расшифровки номера карты и CVV
+- `API_KEY` — API key из Wallester Client Portal
+- `3DS_EMAIL` — email для 3DS кодов
+- `3DS_PASSWORD` — пароль 3DS, общий для выпускаемых карт
 
-Посмотреть список команд:
+Файлы `wallester_private.pem` и `private.pem` нужно заранее скопировать в корень проекта
 
-```powershell
-python .\wallester_cards.py --help
-```
-
-Временный терминальный интерфейс:
-
-```powershell
-python .\terminal_clien.py
-```
-
-## Интерактивный терминальный режим
-
-Если не хочется каждый раз вводить длинные команды с параметрами, используйте временный терминальный интерфейс:
+## Запуск
 
 ```powershell
 python .\terminal_clien.py
@@ -56,47 +49,38 @@ python .\terminal_clien.py
 Терминальный клиент Wallester
 ===============================
 1. Выпустить Expense Virtual Card
-2. Получить данные по карте
-3. Выгрузить карты
-4. Переименовать карту
-5. Закрыть карту
+2. Переименовать карты
+3. Закрыть карты
 q. Выход
 ```
 
-Сценарий работы:
+## Навигация
 
-1. Заполните `.env`, чтобы интерфейс сам подхватил токен:
+- В главном меню введите номер действия.
+- В главном меню `q` завершает программу.
+- Внутри любого действия `q` возвращает в главное меню.
+- Для подтверждений используйте `1` для “да” и `0` для “нет”.
 
-```env
-BASE_URL=https://api-frontend.wallester.com
-TOKEN=replace_with_jwt_token
-3DS_EMAIL=codes@example.com
-3DS_PASSWORD=Card3DS2026!
-```
+## Выпуск карт
 
-Терминальный интерфейс не спрашивает JWT вручную. Если `TOKEN` не заполнен в `.env`, запуск остановится с ошибкой.
+Выберите пункт `1`.
 
-2. Запустите интерфейс:
+Клиент выпускает только `Expense Virtual Card`. Эти параметры подставляются автоматически:
 
-```powershell
-python .\terminal_clien.py
-```
+- `type = Virtual`
+- `is_disposable = false`
+- `security` — дефолтные настройки из программы
+- `3DS` — из `.env`
+- `send_notification = false`
 
-3. Введите номер действия из меню. Для выхода из программы в главном меню введите `q`.
+Пользователь указывает:
 
-4. Отвечайте на вопросы в терминале. Если поле необязательное, его можно оставить пустым и нажать Enter. Для возврата из любого действия в главное меню введите `q`.
+- счет:
+  - `430263 (Евро)`
+  - `446616 (Доллар)`
+- количество карт
 
-5. Для подтверждений используется `1` для ответа “да” и `0` для ответа “нет”.
-
-6. После выполнения операции интерфейс покажет краткую сводку по карте и предложит сохранить полный JSON-ответ в файл.
-
-### Выпуск карты через меню
-
-Выберите `1. Выпустить карту`.
-
-Интерфейс выпускает только `Expense Card` с типом `Virtual`. Поля `type`, `is_disposable`, `security` и 3DS-настройки подставляются автоматически. Пользователь выбирает счет и количество карт.
-
-Названия генерируются автоматически:
+Имена карт генерируются автоматически:
 
 ```text
 Auto card 001
@@ -104,183 +88,47 @@ Auto card 002
 Auto card 003
 ```
 
-`send_notification` всегда отправляется как `false`, webhook-уведомления при выпуске не запрашиваются.
+Перед выпуском клиент покажет первый payload и попросит подтверждение
 
-Перед реальным выпуском интерфейс покажет итоговый payload и спросит подтверждение.
-
-### Получение данных по карте
-
-Выберите `2. Получить данные по карте`.
-
-Нужно ввести `card_id`. Дополнительно можно получить зашифрованные значения:
-
-- `number`
-- `cvv2`
-- `pin`
-- `3ds`
-
-Для этого понадобится файл с base64 RSA public key.
-
-### Выгрузка карт
-
-Выберите `3. Выгрузить список карт`.
-
-Можно указать фильтры:
-
-- `masked_card_number`
-- `reference_number`
-- `external_id`
-- `from_record`
-- `records_count`
-
-После выгрузки интерфейс покажет первые найденные карты. Если указать путь сохранения с расширением `.csv`, результат будет сохранен в CSV. В остальных случаях сохранится JSON.
-
-Примеры путей:
+После выпуска каждой карты клиент покажет только строку с данными карты:
 
 ```text
-.\cards.csv
-.\cards.json
-.\exports\cards.csv
+номер/срок/cvv
 ```
 
-### Переименование карты
+Например:
 
-Выберите `4. Переименовать карту`.
-
-Нужно ввести:
-
-- `card_id`
-- новое название карты
-
-После изменения можно сохранить полный ответ API в JSON-файл.
-
-### Закрытие карты
-
-Выберите `5. Закрыть карту`.
-
-Интерфейс попросит:
-
-- `card_id`
-- причину закрытия
-- ручное подтверждение словом `CLOSE`
-
-Без ввода `CLOSE` карта не будет закрыта.
-
-Посмотреть параметры конкретной команды:
-
-```powershell
-python .\wallester_cards.py issue --help
-python .\wallester_cards.py export --help
-python .\wallester_cards.py close --help
+```text
+4444333322221111/12/28/123
 ```
 
-## Выпуск карты
+## Переименование карт
 
-Минимальный пример выпуска виртуальной карты:
+Выберите пункт `2`.
 
-```powershell
-python .\wallester_cards.py issue --type Virtual --account-id "<account_uuid>" --name "Travel card"
+Клиент сразу берет данные из настроенной Google Sheets
+
+В таблице должны быть заполнены столбцы:
+
+- `Cards` — полный номер карты или `Card ID`;
+- `Имя баера` — новое имя карты.
+
+Перед переименованием клиент покажет количество найденных строк и попросит подтверждение. После этого он найдет `Card ID`, переименует карты в Wallester и покажет список: карта - новое имя
+
+## Закрытие карт
+
+Выберите пункт `3`.
+
+Клиент сразу берет данные из настроенной Google Sheets
+
+В таблице должен быть заполнен столбец:
+
+- `Cards` — полный номер карты или `Card ID`
+
+Перед закрытием клиент покажет список карт и попросит подтвердить действие через `1`. После закрытия появится сообщение `Карты успешно закрыты`
+
+Причина закрытия всегда используется по умолчанию:
+
+```text
+Карта не актуальна
 ```
-
-Выпуск карты из полного JSON-payload:
-
-```powershell
-python .\wallester_cards.py issue --payload .\card_payload.json --output .\issued_card.json
-```
-
-Минимальный payload по документации:
-
-```json
-{
-  "type": "Virtual"
-}
-```
-
-Часто используемые поля payload:
-
-- `type`: `Virtual` или `ChipAndPin`
-- `account_id`: ID счета
-- `name`: название карты
-- `embossing_name`: имя для эмбоссинга
-- `expiration_date`: дата истечения в формате `YYYY-MM-DD`
-- `is_disposable`: одноразовая карта, только для `Virtual`
-- `personalization_product_code`: код дизайна/персонализации
-- `security`: настройки безопасности
-- `3d_secure_settings`: настройки 3DS
-- `limits`: лимиты карты
-- `delivery_address`: адрес доставки для физической карты
-
-## Получение данных по карте
-
-```powershell
-python .\wallester_cards.py get "<card_uuid>" --output .\card.json
-```
-
-Получить зашифрованные PAN/CVV2 через RSA public key:
-
-```powershell
-python .\wallester_cards.py get "<card_uuid>" --public-key-file .\public_key.txt --encrypted number cvv2
-```
-
-Доступные значения для `--encrypted`:
-
-- `number`: номер карты
-- `cvv2`: CVV2
-- `pin`: PIN
-- `3ds`: 3DS password
-
-## Выгрузка карт
-
-Выгрузить карты в CSV:
-
-```powershell
-python .\wallester_cards.py export --records-count 500 --output .\cards.csv
-```
-
-Выгрузить в JSON:
-
-```powershell
-python .\wallester_cards.py export --format json --records-count 500 --output .\cards.json
-```
-
-Фильтры:
-
-```powershell
-python .\wallester_cards.py export --external-id "<external_id>" --output .\cards.csv
-python .\wallester_cards.py export --reference-number "<reference_number>" --output .\cards.csv
-python .\wallester_cards.py export --masked-card-number "416548******0998" --output .\cards.csv
-```
-
-Можно задать поля CSV:
-
-```powershell
-python .\wallester_cards.py export --fields id,name,status,type,masked_card_number,account_id --output .\cards.csv
-```
-
-## Переименование карты
-
-```powershell
-python .\wallester_cards.py rename "<card_uuid>" "New card name"
-```
-
-## Закрытие карты
-
-Закрытие карты считается опасной операцией, поэтому нужен явный флаг `--yes`:
-
-```powershell
-python .\wallester_cards.py close "<card_uuid>" --reason ClosedByClient --yes
-```
-
-Доступные причины закрытия:
-
-- `ClosedByIssuer`
-- `ClosedByClient`
-- `ClosedBySystem`
-- `ClosedByCardholder`
-- `ClosedByReplace`
-
-## Важные замечания
-
-- JWT-токен передается в заголовке `Authorization: Bearer <token>`
-- Не храните реальный `.env` в git, он добавлен в `.gitignore`
-- Реальные вызовы `issue` и `close` меняют состояние карт. Сначала проверяйте команды на тестовом окружении или тестовом аккаунте

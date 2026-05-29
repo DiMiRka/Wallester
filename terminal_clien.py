@@ -3,24 +3,48 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-from wallester_cards import DEFAULT_BASE_URL, DEFAULT_EXPORT_FIELDS, WallesterClient, WallesterError, load_env_file
+from wallester_cards import (
+    DEFAULT_BASE_URL,
+    DEFAULT_USER_AGENT,
+    JWTError,
+    WallesterClient,
+    WallesterError,
+    WallesterJWTProvider,
+    load_env_file,
+    rsa_decrypt_text,
+    rsa_public_key_pem_base64,
+)
 
 
-ACCOUNT_OPTIONS = [
-    ("430263 (Евро)", "51129252"),
-    ("446616 (Доллар)", "95107504"),
+ACCOUNT_OPTIONS: list[dict[str, str]] = [
+    {
+        "label": "430263 (Евро)",
+        "lookup": "51129252",
+        "display_number": "430263",
+        "currency_code": "EUR",
+    },
+    {
+        "label": "446616 (Доллар)",
+        "lookup": "95107504",
+        "display_number": "446616",
+        "currency_code": "USD",
+    },
 ]
 
-CLOSE_REASONS = [
-    "ClosedByClient",
-    "ClosedByCardholder",
-    "ClosedByIssuer",
-    "ClosedBySystem",
-    "ClosedByReplace",
+CLOSE_REASON_OPTIONS: list[dict[str, str]] = [
+    {"label": "Карта не актуальна", "value": "ClosedByClient"},
+    {"label": "Закрыта держателем карты", "value": "ClosedByCardholder"},
+    {"label": "Закрыта эмитентом", "value": "ClosedByIssuer"},
+    {"label": "Закрыта системой", "value": "ClosedBySystem"},
+    {"label": "Закрыта из-за замены", "value": "ClosedByReplace"},
 ]
 
 DEFAULT_SECURITY = {
@@ -29,6 +53,19 @@ DEFAULT_SECURITY = {
     "withdrawal_enabled": False,
     "all_time_limits_enabled": False,
 }
+DEFAULT_RENAME_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1p_qTT1JJrR7zhTUqap5q_ZI9rD6kkqLUBfzVTzhaQPY/"
+    "edit?pli=1&gid=844684271#gid=844684271"
+)
+DEFAULT_CLOSE_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1p_qTT1JJrR7zhTUqap5q_ZI9rD6kkqLUBfzVTzhaQPY/"
+    "edit?pli=1&gid=1502755584#gid=1502755584"
+)
+CARD_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
 
 
 class BackToMenu(Exception):
@@ -57,11 +94,6 @@ def ask(prompt: str, default: str | None = None) -> str:
     if value.lower() == "q":
         raise BackToMenu
     return value or (default or "")
-
-
-def ask_optional(prompt: str, default: str | None = None) -> str | None:
-    value = ask(prompt, default)
-    return value or None
 
 
 def ask_int(prompt: str, default: int, minimum: int = 0) -> int:
@@ -110,59 +142,93 @@ def choose(title: str, options: list[str], default_index: int = 0) -> str:
     return options[index]
 
 
-def choose_account_id() -> str:
-    label = choose("Выберите счет", [label for label, _account_id in ACCOUNT_OPTIONS])
-    for option_label, account_id in ACCOUNT_OPTIONS:
-        if option_label == label:
-            return account_id
-    return ACCOUNT_OPTIONS[0][1]
+def choose_account() -> dict[str, str]:
+    label = choose("Выберите счет", [option["label"] for option in ACCOUNT_OPTIONS])
+    for option in ACCOUNT_OPTIONS:
+        if option["label"] == label:
+            return option
+    return ACCOUNT_OPTIONS[0]
+
+
+def resolve_account_id(client: WallesterClient, account: dict[str, str]) -> str:
+    lookup = account["lookup"]
+    display_number = account["display_number"]
+    currency_code = account["currency_code"]
+    response = client.search_accounts(
+        {
+            "from_record": 0,
+            "records_count": 1000,
+        }
+    )
+    accounts = response.get("accounts", []) if isinstance(response, dict) else []
+    matches = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        values = {
+            str(item.get("id", "")),
+            str(item.get("name", "")),
+            str(item.get("external_id", "")),
+            str(item.get("reference_number", "")),
+        }
+        same_lookup = lookup in values or display_number in values
+        same_currency = item.get("currency_code") == currency_code
+        if same_lookup and same_currency:
+            matches.append(item)
+
+    if not matches:
+        raise ValueError(
+            "Не удалось найти UUID счета для "
+            f"{account['label']} по значению {lookup}. "
+            "В Wallester API поле account_id должно быть UUID, а не короткий номер счета."
+        )
+    if len(matches) > 1:
+        active_matches = [item for item in matches if item.get("status") == "Active"]
+        if len(active_matches) == 1:
+            return str(active_matches[0]["id"])
+        raise ValueError(
+            "Найдено несколько подходящих счетов для "
+            f"{account['label']}. Нужно уточнить UUID счета вручную."
+        )
+
+    account_id = matches[0].get("id")
+    if not account_id:
+        raise ValueError(f"У найденного счета {account['label']} нет поля id.")
+    return str(account_id)
 
 
 def print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def save_if_needed(data: Any) -> None:
-    output = ask_optional("Сохранить полный ответ API в файл? Укажите путь или оставьте пустым")
-    if not output:
-        return
-    Path(output).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"Сохранено: {output}")
-
-
-def card_summary(data: dict[str, Any]) -> None:
+def extract_card(data: dict[str, Any]) -> dict[str, Any]:
     card = data.get("card", data)
-    if not isinstance(card, dict):
-        print_json(data)
-        return
-    fields = [
-        "id",
-        "name",
-        "status",
-        "type",
-        "is_disposable",
-        "masked_card_number",
-        "account_id",
-        "person_id",
-        "company_id",
-        "currency_code",
-        "expiry_date",
-        "created_at",
-        "updated_at",
-    ]
-    for field in fields:
-        value = card.get(field)
-        if value not in (None, ""):
-            print(f"{field}: {value}")
+    return card if isinstance(card, dict) else {}
 
 
 def build_client() -> WallesterClient:
     load_env_file(Path(".env"))
     base_url = os.getenv("BASE_URL", DEFAULT_BASE_URL)
-    token = os.getenv("TOKEN")
-    if not token:
-        raise SystemExit("TOKEN не задан. Добавьте его в .env.")
-    return WallesterClient(base_url=base_url, token=token)
+    user_agent = os.getenv("USER_AGENT", DEFAULT_USER_AGENT)
+    api_key = os.getenv("API_KEY", "").strip()
+    private_key_path = os.getenv("PRIVATE_KEY_PATH", "").strip()
+    if not api_key or not private_key_path:
+        raise SystemExit("В .env должны быть заданы API_KEY и PRIVATE_KEY_PATH.")
+    jwt_provider = WallesterJWTProvider(
+        api_key=api_key,
+        private_key_path=private_key_path,
+    )
+    return WallesterClient(base_url=base_url, jwt_provider=jwt_provider, user_agent=user_agent)
+
+
+def get_private_key_path() -> str:
+    private_key_path = os.getenv("CARD_DATA_PRIVATE_KEY_PATH", "").strip()
+    if private_key_path:
+        return private_key_path
+    private_key_path = os.getenv("PRIVATE_KEY_PATH", "").strip()
+    if not private_key_path:
+        raise ValueError("В .env не задан CARD_DATA_PRIVATE_KEY_PATH или PRIVATE_KEY_PATH.")
+    return private_key_path
 
 
 def get_3ds_defaults() -> tuple[str, str]:
@@ -193,9 +259,46 @@ def build_expense_virtual_payload(account_id: str, name: str) -> dict[str, Any]:
     }
 
 
+def encrypted_field(response: Any, field_name: str) -> str:
+    if not isinstance(response, dict):
+        raise ValueError(f"Wallester не вернул поле {field_name}.")
+    value = response.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Wallester не вернул поле {field_name}.")
+    return value
+
+
+def format_expiry_date(card: dict[str, Any]) -> str:
+    value = card.get("expiry_date") or card.get("expiration_date") or card.get("expires_at")
+    if not value:
+        return "срок не найден"
+    text = str(value)
+    if len(text) >= 7 and text[4] == "-":
+        return f"{text[5:7]}/{text[2:4]}"
+    return text
+
+
+def card_sensitive_line(client: WallesterClient, card_id: str, card: dict[str, Any]) -> str:
+    private_key_path = get_private_key_path()
+    public_key = rsa_public_key_pem_base64(private_key_path)
+    encrypted_number = encrypted_field(
+        client.encrypted_value(card_id, "number", public_key),
+        "encrypted_card_number",
+    )
+    encrypted_cvv = encrypted_field(
+        client.encrypted_value(card_id, "cvv2", public_key),
+        "encrypted_cvv2",
+    )
+    number = rsa_decrypt_text(encrypted_number, private_key_path)
+    cvv = rsa_decrypt_text(encrypted_cvv, private_key_path)
+    return f"{number}/{format_expiry_date(card)}/{cvv}"
+
+
 def issue_card(client: WallesterClient) -> None:
     print("\nВыпуск Expense Virtual Card")
-    account_id = choose_account_id()
+    account = choose_account()
+    print(f"Ищу UUID счета для {account['label']}...")
+    account_id = resolve_account_id(client, account)
     count = ask_int("Количество карт", 1, minimum=1)
     payloads = [
         build_expense_virtual_payload(account_id, f"Auto card {idx:03d}")
@@ -217,84 +320,233 @@ def issue_card(client: WallesterClient) -> None:
         print(f"\nВыпуск {index}/{count}: {payload['name']}")
         result = client.create_card(payload, send_notification=False)
         results.append(result)
-        card_summary(result)
+        card = extract_card(result)
+        card_id = card.get("id")
+        if not card_id:
+            raise ValueError("Wallester не вернул ID выпущенной карты.")
+        try:
+            print(card_sensitive_line(client, str(card_id), card))
+        except (JWTError, WallesterError, ValueError) as exc:
+            print(f"Карта выпущена, но данные номер/срок/cvv не удалось получить: {exc}")
 
-    save_if_needed({"issued_cards": results})
-
-
-def get_card(client: WallesterClient) -> None:
-    print("\nПолучение данных по карте")
-    card_id = ask("Card ID")
-    result = client.get_card(card_id)
-    if ask_bool("Получить зашифрованные PAN/CVV2/PIN/3DS?", False):
-        public_key_path = ask("Путь к файлу с base64 RSA public key")
-        public_key = Path(public_key_path).read_text(encoding="utf-8").strip()
-        encrypted: dict[str, Any] = {}
-        for kind in ["number", "cvv2", "pin", "3ds"]:
-            if ask_bool(f"Получить {kind}?", kind in {"number", "cvv2"}):
-                encrypted[kind] = client.encrypted_value(card_id, kind, public_key)
-        result["encrypted"] = encrypted
-    print()
-    card_summary(result)
-    if ask_bool("Показать полный JSON?", False):
-        print_json(result)
-    save_if_needed(result)
+    print("\nКарты успешно выпущены")
+    print("=" * 24)
+    for result in results:
+        card = extract_card(result)
+        name = card.get("name") or "Без названия"
+        card_id = card.get("id") or "ID не найден"
+        print(f"- {name}: {card_id}")
 
 
-def export_cards(client: WallesterClient) -> None:
-    print("\nВыгрузка карт")
-    query = {
-        "masked_card_number": ask_optional("Маскированный номер карты"),
-        "reference_number": ask_optional("Reference number"),
-        "external_id": ask_optional("External ID"),
-        "from_record": ask_int("Начальная запись from_record", 0, minimum=0),
-        "records_count": ask_int("Количество записей records_count", 100, minimum=1),
-    }
-    result = client.search_cards(query)
-    cards = result.get("cards", [])
-    print(f"\nЗаписей в ответе: {len(cards)}")
-    print(f"Всего записей по фильтру: {result.get('total_records_number', 'не указано')}")
-    for card in cards[:10]:
-        print("- " + " | ".join(str(card.get(field, "")) for field in ["id", "name", "status", "masked_card_number"]))
-    if len(cards) > 10:
-        print(f"... еще {len(cards) - 10}")
-
-    output = ask_optional("Сохранить выгрузку в файл? Укажите путь или оставьте пустым")
-    if output:
-        if output.lower().endswith(".csv"):
-            with open(output, "w", encoding="utf-8", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=DEFAULT_EXPORT_FIELDS, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(cards)
-        else:
-            Path(output).write_text(json.dumps(cards, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(f"Сохранено: {output}")
+def google_sheet_csv_url(sheet_url: str) -> str:
+    parsed = urllib.parse.urlparse(sheet_url)
+    match = re.search(r"/spreadsheets/d/([^/]+)", parsed.path)
+    if not match:
+        raise ValueError("Не удалось определить ID Google Sheets из ссылки.")
+    query = urllib.parse.parse_qs(parsed.query)
+    gid = query.get("gid", ["0"])[0]
+    if parsed.fragment.startswith("gid="):
+        gid = parsed.fragment.removeprefix("gid=")
+    return f"https://docs.google.com/spreadsheets/d/{match.group(1)}/export?format=csv&gid={gid}"
 
 
-def rename_card(client: WallesterClient) -> None:
-    print("\nПереименование карты")
-    card_id = ask("Card ID")
-    new_name = ask("Новое название карты")
-    result = client.rename_card(card_id, new_name)
-    print("\nКарта переименована:")
-    card_summary(result)
-    save_if_needed(result)
+def load_rename_rows(sheet_url: str) -> list[dict[str, str]]:
+    csv_url = google_sheet_csv_url(sheet_url)
+    request = urllib.request.Request(
+        csv_url,
+        headers={"User-Agent": os.getenv("USER_AGENT", DEFAULT_USER_AGENT)},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            content = response.read().decode("utf-8-sig")
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"Не удалось скачать таблицу: HTTP {exc.code}. Проверьте доступ по ссылке.") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Не удалось скачать таблицу: {exc.reason}") from exc
+
+    reader = csv.DictReader(content.splitlines())
+    if not reader.fieldnames:
+        raise ValueError("В таблице не найдены заголовки.")
+    missing_columns = [column for column in ["Cards", "Имя баера"] if column not in reader.fieldnames]
+    if missing_columns:
+        raise ValueError("В таблице не найдены столбцы: " + ", ".join(missing_columns))
+
+    rows = []
+    for row in reader:
+        card_value = (row.get("Cards") or "").strip()
+        buyer_name = (row.get("Имя баера") or "").strip()
+        if card_value and buyer_name:
+            rows.append({"card_value": card_value, "name": buyer_name})
+    return rows
 
 
-def close_card(client: WallesterClient) -> None:
-    print("\nЗакрытие карты")
-    card_id = ask("Card ID")
-    reason = choose("Причина закрытия", CLOSE_REASONS)
-    print(f"\nБудет закрыта карта: {card_id}")
-    print(f"Причина: {reason}")
-    confirm = ask("Для подтверждения введите CLOSE")
-    if confirm != "CLOSE":
+def load_card_values(sheet_url: str) -> list[str]:
+    csv_url = google_sheet_csv_url(sheet_url)
+    request = urllib.request.Request(
+        csv_url,
+        headers={"User-Agent": os.getenv("USER_AGENT", DEFAULT_USER_AGENT)},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            content = response.read().decode("utf-8-sig")
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"Не удалось скачать таблицу: HTTP {exc.code}. Проверьте доступ по ссылке.") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Не удалось скачать таблицу: {exc.reason}") from exc
+
+    reader = csv.DictReader(content.splitlines())
+    if not reader.fieldnames:
+        raise ValueError("В таблице не найдены заголовки.")
+    if "Cards" not in reader.fieldnames:
+        raise ValueError("В таблице не найден столбец: Cards")
+
+    values = []
+    for row in reader:
+        card_value = (row.get("Cards") or "").strip()
+        if card_value:
+            values.append(card_value)
+    return values
+
+
+def card_number_digits(card_value: str) -> str:
+    number_part = card_value.split("/", 1)[0]
+    return "".join(char for char in number_part if char.isdigit())
+
+
+def masked_number_from_card_number(card_number: str) -> str:
+    if len(card_number) < 10:
+        raise ValueError(f"в столбце Cards должен быть полный номер карты или Card ID, получено: {card_number}")
+    return f"{card_number[:6]}******{card_number[-4:]}"
+
+
+def decrypted_card_number(client: WallesterClient, card_id: str) -> str:
+    private_key_path = get_private_key_path()
+    public_key = rsa_public_key_pem_base64(private_key_path)
+    encrypted_number = encrypted_field(
+        client.encrypted_value(card_id, "number", public_key),
+        "encrypted_card_number",
+    )
+    return rsa_decrypt_text(encrypted_number, private_key_path)
+
+
+def find_card_id_by_card_value(client: WallesterClient, card_value: str) -> str:
+    value = card_value.strip()
+    if CARD_ID_RE.match(value):
+        return value
+
+    card_number = card_number_digits(value)
+    masked_number = masked_number_from_card_number(card_number)
+    response = client.search_cards(
+        {
+            "masked_card_number": masked_number,
+            "from_record": 0,
+            "records_count": 10,
+        }
+    )
+    cards = response.get("cards", []) if isinstance(response, dict) else []
+    if not cards:
+        raise ValueError(f"карта не найдена по маске {masked_number}")
+    if len(cards) == 1:
+        card_id = cards[0].get("id")
+        if not card_id:
+            raise ValueError(f"у найденной карты нет ID по маске {masked_number}")
+        return str(card_id)
+
+    for card in cards:
+        card_id = card.get("id")
+        if not card_id:
+            continue
+        try:
+            if decrypted_card_number(client, str(card_id)) == card_number:
+                return str(card_id)
+        except (JWTError, WallesterError, ValueError):
+            continue
+    raise ValueError(f"найдено несколько карт по маске {masked_number}, но точное совпадение по полному номеру не найдено")
+
+
+def rename_cards(client: WallesterClient) -> None:
+    print("\nПереименование карт")
+    rows = load_rename_rows(DEFAULT_RENAME_SHEET_URL)
+    if not rows:
+        print("В таблице нет строк, где заполнены Cards и Имя баера.")
+        return
+
+    print(f"\nНайдено строк для переименования: {len(rows)}")
+    print("Первые строки:")
+    for row in rows[:5]:
+        print(f"- {row['card_value']} -> {row['name']}")
+    if len(rows) > 5:
+        print(f"... еще {len(rows) - 5}")
+
+    if not ask_bool("Переименовать карты?", False):
         print("Операция отменена.")
         return
-    result = client.close_card(card_id, reason)
-    print("\nКарта закрыта:")
-    card_summary(result)
-    save_if_needed(result)
+
+    renamed_cards = []
+    errors = []
+    for index, row in enumerate(rows, start=1):
+        card_value = row["card_value"]
+        new_name = row["name"]
+        print(f"\nПереименование {index}/{len(rows)}: {card_value} -> {new_name}")
+        try:
+            card_id = find_card_id_by_card_value(client, card_value)
+            client.rename_card(card_id, new_name)
+        except (ValueError, WallesterError) as exc:
+            errors.append(f"{card_value}: {exc}")
+            print(f"Ошибка: {exc}")
+            continue
+        renamed_cards.append({"card_value": card_value, "name": new_name})
+        print("Готово")
+
+    print("\nКарты переименованы")
+    print("=" * 20)
+    for renamed_card in renamed_cards:
+        print(f'{renamed_card["card_value"]} - новое имя "{renamed_card["name"]}"')
+    if errors:
+        print(f"\nОшибок: {len(errors)}")
+        for error in errors:
+            print(f"- {error}")
+
+
+def close_cards(client: WallesterClient) -> None:
+    print("\nЗакрытие карт")
+    card_values = load_card_values(DEFAULT_CLOSE_SHEET_URL)
+    if not card_values:
+        print("В таблице нет строк, где заполнен столбец Cards.")
+        return
+
+    reason_label = CLOSE_REASON_OPTIONS[0]["label"]
+    reason = CLOSE_REASON_OPTIONS[0]["value"]
+    print(f"\nНайдено карт для закрытия: {len(card_values)}")
+    print(f"Причина закрытия: {reason_label}")
+    print("Карты:")
+    for card_value in card_values:
+        print(f"- {card_value}")
+
+    if not ask_bool("Закрыть карты?", False):
+        print("Операция отменена.")
+        return
+
+    success_count = 0
+    errors = []
+    for index, card_value in enumerate(card_values, start=1):
+        print(f"\nЗакрытие {index}/{len(card_values)}: {card_value}")
+        try:
+            card_id = find_card_id_by_card_value(client, card_value)
+            client.close_card(card_id, reason)
+        except (ValueError, WallesterError) as exc:
+            errors.append(f"{card_value}: {exc}")
+            print(f"Ошибка: {exc}")
+            continue
+        success_count += 1
+        print("Готово")
+
+    print("\nКарты успешно закрыты")
+    print(f"Успешно: {success_count}")
+    if errors:
+        print(f"\nОшибок: {len(errors)}")
+        for error in errors:
+            print(f"- {error}")
 
 
 def show_menu() -> str:
@@ -302,10 +554,8 @@ def show_menu() -> str:
     print("Терминальный клиент Wallester")
     print("=" * 31)
     print("1. Выпустить Expense Virtual Card")
-    print("2. Получить данные по карте")
-    print("3. Выгрузить карты")
-    print("4. Переименовать карту")
-    print("5. Закрыть карту")
+    print("2. Переименовать карты")
+    print("3. Закрыть карты")
     print("q. Выход")
     return input("Выберите действие: ").strip().lower()
 
@@ -315,10 +565,8 @@ def main() -> int:
     client = build_client()
     actions = {
         "1": issue_card,
-        "2": get_card,
-        "3": export_cards,
-        "4": rename_card,
-        "5": close_card,
+        "2": rename_cards,
+        "3": close_cards,
     }
     while True:
         choice = show_menu()
