@@ -16,7 +16,7 @@ Copy-Item .env.example .env
 ==== Можем оставить дефолтные значения ====
 BASE_URL=https://api-frontend.wallester.com  -  
 USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36
-PRIVATE_KEY_PATH=wallester_private.pem
+PRIVATE_KEY_PATH=private.pem
 CARD_DATA_PRIVATE_KEY_PATH=wallester_private.pem
 
 ==== Необходимо вставить свои значения ====
